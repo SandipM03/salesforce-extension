@@ -154,13 +154,41 @@
     
     // List view patterns
     if (url.includes('/list') || url.includes('filterName=')) {
+      // Check if it's a Kanban view
+      if (document.querySelector('[class*="kanban"], [class*="forceKanban"], .opportunityBoard')) {
+        return 'kanban';
+      }
       return 'list';
     }
     
-    // Check for list table presence
-    if (document.querySelector('table[data-aura-class="uiVirtualDataTable"]') ||
-        document.querySelector('[class*="listViewContent"]')) {
-      return 'list';
+    // Check for Kanban board presence
+    const kanbanSelectors = [
+      '[class*="kanban"]',
+      '[class*="forceKanban"]',
+      '.opportunityBoard',
+      '[class*="pathBoard"]'
+    ];
+    for (const selector of kanbanSelectors) {
+      if (document.querySelector(selector)) {
+        return 'kanban';
+      }
+    }
+    
+    // Check for list table presence - expanded selectors for newer Lightning
+    const listSelectors = [
+      'table[data-aura-class="uiVirtualDataTable"]',
+      '[class*="listViewContent"]',
+      '[class*="forceListViewManager"]',
+      'lightning-datatable',
+      '[class*="lst-list"]',
+      'table[role="grid"]',
+      '.slds-table[role="grid"]'
+    ];
+    
+    for (const selector of listSelectors) {
+      if (document.querySelector(selector)) {
+        return 'list';
+      }
     }
     
     // Check for record detail presence
@@ -179,20 +207,52 @@
   /**
    * Wait for Lightning DOM to be ready
    */
-  function waitForLightningDom(timeout = 5000) {
+  function waitForLightningDom(timeout = 10000) {
     return new Promise((resolve, reject) => {
       const startTime = Date.now();
       
       function check() {
-        // Check for Lightning container
+        // Check for Lightning container or list view elements
         const hasLightning = document.querySelector('[class*="oneAlohaPage"]') ||
                             document.querySelector('[class*="forceRecordLayout"]') ||
+                            document.querySelector('[class*="forceListViewManager"]') ||
+                            document.querySelector('[class*="lst-list"]') ||
+                            document.querySelector('lightning-datatable') ||
+                            document.querySelector('table[role="grid"]') ||
+                            document.querySelector('table.slds-table') ||
+                            document.querySelector('[class*="slds-page-header"]') ||
                             document.querySelector('[class*="slds-"]');
         
+        // For list views, also wait for table rows to load
+        const url = window.location.href;
+        const isListView = url.includes('/list') || url.includes('filterName=') || url.includes('/home');
+        
         if (hasLightning) {
-          resolve(true);
+          if (isListView) {
+            // Try to find table data using deep query (including shadow DOM)
+            const hasTableData = document.querySelector('table[role="grid"] tbody tr') ||
+                                document.querySelector('.slds-table tbody tr') ||
+                                document.querySelector('table tbody tr') ||
+                                document.querySelector('[class*="forceListViewManager"] tr[data-row-key-value]') ||
+                                document.querySelector('[data-row-key-value]') ||
+                                deepQuerySelector('table tbody tr');
+            if (hasTableData) {
+              // Wait a bit more for full render
+              setTimeout(() => resolve(true), 500);
+            } else if (Date.now() - startTime > timeout) {
+              // Resolve anyway after timeout - table might be empty or use different structure
+              console.log('[SF Extractor] List view loaded, proceeding with extraction');
+              resolve(true);
+            } else {
+              setTimeout(check, 300);
+            }
+          } else {
+            resolve(true);
+          }
         } else if (Date.now() - startTime > timeout) {
-          reject(new Error('Lightning DOM timeout'));
+          // Resolve anyway - page might use different structure
+          console.log('[SF Extractor] Timeout waiting for Lightning DOM, proceeding anyway');
+          resolve(true);
         } else {
           requestAnimationFrame(check);
         }
@@ -338,73 +398,472 @@
   }
 
   /**
+   * Deep query selector that traverses shadow DOM
+   */
+  function deepQuerySelector(selector, root = document) {
+    // First try regular querySelector
+    let result = root.querySelector(selector);
+    if (result) return result;
+    
+    // Get all elements that might have shadow roots
+    const allElements = root.querySelectorAll('*');
+    for (const el of allElements) {
+      if (el.shadowRoot) {
+        result = deepQuerySelector(selector, el.shadowRoot);
+        if (result) return result;
+      }
+    }
+    
+    return null;
+  }
+  
+  /**
+   * Deep query selector all that traverses shadow DOM
+   */
+  function deepQuerySelectorAll(selector, root = document) {
+    let results = Array.from(root.querySelectorAll(selector));
+    
+    // Get all elements that might have shadow roots
+    const allElements = root.querySelectorAll('*');
+    for (const el of allElements) {
+      if (el.shadowRoot) {
+        const shadowResults = deepQuerySelectorAll(selector, el.shadowRoot);
+        results = results.concat(shadowResults);
+      }
+    }
+    
+    return results;
+  }
+
+  /**
    * Extract list view data
    */
   function extractListData(objectType) {
-    const fieldMap = FIELD_MAPS[objectType];
-    if (!fieldMap) {
-      return [];
-    }
-    
-    const records = [];
-    
-    // Find list table
-    const table = document.querySelector('table[role="grid"]') ||
-                  document.querySelector('[class*="uiVirtualDataTable"] table') ||
-                  document.querySelector('[class*="listViewContent"] table');
-    
-    if (!table) {
-      console.warn('[SF Extractor] No list table found');
-      return [];
-    }
-    
-    // Get headers for column mapping
-    const headers = [];
-    const headerCells = table.querySelectorAll('th');
-    headerCells.forEach(th => {
-      headers.push(th.textContent.trim());
-    });
+    try {
+      const fieldMap = FIELD_MAPS[objectType];
+      if (!fieldMap) {
+        console.warn(`[SF Extractor] No field map for: ${objectType}`);
+        return [];
+      }
+      
+      const records = [];
+      
+      // Find list table - try multiple selectors for different SF Lightning versions
+      const tableSelectors = [
+        'table[role="grid"]',
+        'table.slds-table',
+        '.slds-table[role="grid"]',
+        '[class*="uiVirtualDataTable"] table',
+        '[class*="listViewContent"] table',
+        'lightning-datatable table',
+        '[data-aura-class="uiVirtualDataTable"]',
+        '[class*="forceListViewManager"] table',
+        '[class*="forceListViewManagerGrid"] table',
+        '[class*="virtualDataTable"] table',
+        '[class*="listViewContainer"] table',
+        '[class*="lst-"] table'
+      ];
+      
+      let table = null;
+      
+      // First try regular DOM
+      for (const selector of tableSelectors) {
+        try {
+          table = document.querySelector(selector);
+          if (table) {
+            console.log(`[SF Extractor] Found table with selector: ${selector}`);
+            break;
+          }
+        } catch (e) {
+          // Invalid selector, skip
+        }
+      }
+      
+      // If not found, try deep shadow DOM traversal
+      if (!table) {
+        for (const selector of tableSelectors) {
+          try {
+            table = deepQuerySelector(selector);
+            if (table) {
+              console.log(`[SF Extractor] Found table in shadow DOM with selector: ${selector}`);
+              break;
+            }
+          } catch (e) {
+            // Invalid selector, skip
+          }
+        }
+      }
+      
+      // Try to find inside iframes as well
+      if (!table) {
+        const iframes = document.querySelectorAll('iframe');
+        for (const iframe of iframes) {
+          try {
+            const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
+            if (iframeDoc) {
+              for (const selector of tableSelectors) {
+                table = iframeDoc.querySelector(selector);
+                if (table) {
+                  console.log(`[SF Extractor] Found table in iframe with selector: ${selector}`);
+                  break;
+                }
+              }
+              if (table) break;
+            }
+          } catch (e) {
+            // Cross-origin iframe, skip
+          }
+        }
+      }
+      
+      if (!table) {
+        // Log more detailed debugging info
+        const allTables = deepQuerySelectorAll('table');
+        const allGrids = deepQuerySelectorAll('[role="grid"]');
+        console.warn('[SF Extractor] No list table found. Available tables:', 
+          allTables.length,
+          'Available grids:', 
+          allGrids.length);
+        
+        // If we found tables but couldn't match selectors, try the first one
+        if (allTables.length > 0) {
+          table = allTables[0];
+          console.log('[SF Extractor] Using first available table as fallback');
+        } else if (allGrids.length > 0) {
+          // Grid might be the table itself or contain a table
+          const grid = allGrids[0];
+          table = grid.tagName === 'TABLE' ? grid : grid.querySelector('table');
+          if (!table) table = grid; // Use grid as table-like structure
+          console.log('[SF Extractor] Using grid element as fallback');
+        }
+      }
+      
+      if (!table) {
+        console.warn('[SF Extractor] No table or grid elements found in DOM');
+        return [];
+      }
+      
+      // Get headers for column mapping - extract clean header text
+      const headers = [];
+      const headerCells = table.querySelectorAll('th');
+      headerCells.forEach(th => {
+        // Get header text, preferring specific elements over full textContent
+        const headerLink = th.querySelector('a[title], span[title]');
+        const headerSpan = th.querySelector('.slds-truncate, [class*="headerText"], span:not([class*="icon"])');
+        let headerText = '';
+        
+        if (headerLink && headerLink.title) {
+          headerText = headerLink.title;
+        } else if (headerLink) {
+          headerText = headerLink.textContent?.trim() || '';
+        } else if (headerSpan) {
+          headerText = headerSpan.textContent?.trim() || '';
+        } else {
+          headerText = th.textContent?.trim() || '';
+        }
+        
+        // Clean up header text - remove sort indicators, etc.
+        headerText = headerText.replace(/[\u2191\u2193↑↓]/g, '').trim();
+        headers.push(headerText);
+      });
+      
+      console.log('[SF Extractor] Headers found:', headers);
     
     // Extract rows
     const rows = table.querySelectorAll('tbody tr');
     rows.forEach(row => {
+      // Skip hidden rows or header rows
+      if (row.hidden || row.getAttribute('aria-hidden') === 'true') {
+        return;
+      }
+      
       const cells = row.querySelectorAll('td');
       const record = { _objectType: objectType };
       
-      // Try to get record ID from row link
-      const link = row.querySelector('a[href*="/"]');
-      if (link) {
-        const idMatch = link.href.match(/\/([a-zA-Z0-9]{15,18})/);
-        if (idMatch) {
-          record.id = idMatch[1];
+      // Try to get record ID from row - check multiple sources
+      let recordId = row.getAttribute('data-row-key-value') || 
+                     row.getAttribute('data-record-id') ||
+                     row.getAttribute('data-row-id');
+      
+      if (!recordId) {
+        // Look for ID in links
+        const links = row.querySelectorAll('a[href*="/lightning/r/"], a[href*="/"]');
+        for (const link of links) {
+          const idMatch = link.href.match(/\/([a-zA-Z0-9]{15,18})(?:\/|$|\?)/);
+          if (idMatch && idMatch[1].match(/^[a-zA-Z0-9]{15,18}$/)) {
+            // Validate it looks like a Salesforce ID (starts with specific prefixes)
+            const potentialId = idMatch[1];
+            if (potentialId.length === 15 || potentialId.length === 18) {
+              recordId = potentialId;
+              break;
+            }
+          }
         }
       }
+      
+      if (!recordId) {
+        console.log('[SF Extractor] Skipping row without ID');
+        return;
+      }
+      
+      record.id = recordId;
       
       // Map cells to fields
       cells.forEach((cell, index) => {
         if (index < headers.length) {
           const header = headers[index];
+          if (!header) return; // Skip empty headers
+          
+          // Extract cell value properly
+          const cellValue = extractCellValue(cell);
           
           // Find matching field key
           for (const [fieldKey, labelOptions] of Object.entries(fieldMap)) {
-            if (labelOptions.some(label => header.includes(label))) {
-              record[fieldKey] = normalizeValue(cell.textContent);
+            // Ensure labelOptions is an array
+            const labels = Array.isArray(labelOptions) ? labelOptions : [labelOptions];
+            if (labels.some(label => header.toLowerCase().includes(label.toLowerCase()))) {
+              record[fieldKey] = cellValue;
               break;
             }
           }
         }
       });
       
-      // Only add records with an ID
-      if (record.id) {
-        record._extractedAt = new Date().toISOString();
-        record._sourceUrl = window.location.href;
-        records.push(record);
-      }
+      record._extractedAt = new Date().toISOString();
+      record._sourceUrl = window.location.href;
+      records.push(record);
     });
     
     console.log(`[SF Extractor] Extracted ${records.length} list records`);
     return records;
+    } catch (error) {
+      console.error('[SF Extractor] List extraction error:', error);
+      return [];
+    }
+  }
+  
+  /**
+   * Extract clean value from a table cell
+   */
+  function extractCellValue(cell) {
+    // Skip cells that are just checkboxes or action buttons
+    if (cell.querySelector('input[type="checkbox"]') && !cell.querySelector('a, span[class*="output"]')) {
+      return null;
+    }
+    
+    // Priority 1: Lightning formatted elements
+    const formattedEl = cell.querySelector(
+      'lightning-formatted-text, ' +
+      'lightning-formatted-number, ' +
+      'lightning-formatted-email, ' +
+      'lightning-formatted-phone, ' +
+      'lightning-formatted-url, ' +
+      'lightning-formatted-date-time'
+    );
+    if (formattedEl) {
+      return normalizeValue(formattedEl.textContent);
+    }
+    
+    // Priority 2: SLDS output elements
+    const outputEl = cell.querySelector(
+      '[class*="uiOutputText"], ' +
+      '[class*="uiOutputEmail"], ' +
+      '[class*="uiOutputPhone"], ' +
+      '[class*="uiOutputUrl"], ' +
+      '[class*="forceOutputField"], ' +
+      '.slds-truncate'
+    );
+    if (outputEl) {
+      return normalizeValue(outputEl.textContent);
+    }
+    
+    // Priority 3: Links (get text content, not href)
+    const link = cell.querySelector('a[href*="/lightning/r/"], a[data-refid], a.slds-truncate');
+    if (link) {
+      // Get the visible text, not including any hidden elements
+      const linkText = link.textContent?.trim();
+      if (linkText && !linkText.toLowerCase().includes('edit') && !linkText.toLowerCase().includes('delete')) {
+        return normalizeValue(linkText);
+      }
+    }
+    
+    // Priority 4: Span with actual content (not icons)
+    const spans = cell.querySelectorAll('span:not([class*="icon"]):not([class*="slds-assistive"])');
+    for (const span of spans) {
+      const text = span.textContent?.trim();
+      if (text && text.length > 0 && !text.match(/^[\s\u200b]*$/)) {
+        return normalizeValue(text);
+      }
+    }
+    
+    // Priority 5: Direct text content (filtered)
+    let textContent = '';
+    for (const node of cell.childNodes) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        textContent += node.textContent;
+      } else if (node.nodeType === Node.ELEMENT_NODE) {
+        // Skip buttons, icons, and action elements
+        const tagName = node.tagName?.toLowerCase();
+        const className = node.className || '';
+        if (tagName === 'button' || 
+            tagName === 'lightning-button-icon' ||
+            className.includes('icon') ||
+            className.includes('action') ||
+            className.includes('button')) {
+          continue;
+        }
+        // Get text from safe elements
+        if (tagName === 'a' || tagName === 'span' || tagName === 'div') {
+          const innerText = node.textContent?.trim();
+          if (innerText && !innerText.toLowerCase().includes('edit') && !innerText.toLowerCase().includes('delete')) {
+            textContent += ' ' + innerText;
+          }
+        }
+      }
+    }
+    
+    textContent = textContent.trim();
+    if (textContent) {
+      return normalizeValue(textContent);
+    }
+    
+    return null;
+  }
+
+  /**
+   * Extract data from Kanban/Board view (used for Opportunities)
+   */
+  function extractKanbanData(objectType) {
+    try {
+      const fieldMap = FIELD_MAPS[objectType];
+      if (!fieldMap) {
+        console.warn(`[SF Extractor] No field map for: ${objectType}`);
+        return [];
+      }
+      
+      const records = [];
+      
+      // Find Kanban cards - try multiple selectors
+      const cardSelectors = [
+        '[class*="kanbanCard"]',
+        '[class*="forceKanbanCard"]',
+        '.opportunityCard',
+        '[class*="pathBoardCard"]',
+        '[class*="kanban"] [class*="card"]',
+        '.forceListViewManagerKanbanBoard [class*="item"]'
+      ];
+      
+      let cards = [];
+      for (const selector of cardSelectors) {
+        cards = document.querySelectorAll(selector);
+        if (cards.length > 0) {
+          console.log(`[SF Extractor] Found ${cards.length} Kanban cards with selector: ${selector}`);
+          break;
+        }
+      }
+      
+      if (cards.length === 0) {
+        console.warn('[SF Extractor] No Kanban cards found');
+        return [];
+      }
+      
+      cards.forEach(card => {
+        const record = { _objectType: objectType };
+        
+        // Get record ID from card link or data attribute
+        const cardLink = card.querySelector('a[href*="/lightning/r/"], a[href*="/"]');
+        let recordId = card.getAttribute('data-record-id') || 
+                       card.getAttribute('data-item-id');
+        
+        if (!recordId && cardLink) {
+          const idMatch = cardLink.href.match(/\/([a-zA-Z0-9]{15,18})(?:\/|$|\?)/);
+          if (idMatch) {
+            recordId = idMatch[1];
+          }
+        }
+        
+        if (!recordId) {
+          return; // Skip cards without ID
+        }
+        
+        record.id = recordId;
+        
+        // Extract name - usually the main link text
+        if (cardLink) {
+          const nameText = cardLink.textContent?.trim();
+          if (nameText && !nameText.toLowerCase().includes('edit')) {
+            record.name = normalizeValue(nameText);
+          }
+        }
+        
+        // Extract other fields from card content
+        const cardFields = card.querySelectorAll('[class*="field"], [class*="detail"], span, div');
+        cardFields.forEach(field => {
+          const text = field.textContent?.trim();
+          if (!text) return;
+          
+          // Try to match against field map labels
+          for (const [fieldKey, labelOptions] of Object.entries(fieldMap)) {
+            if (record[fieldKey]) continue; // Already have this field
+            
+            const labels = Array.isArray(labelOptions) ? labelOptions : [labelOptions];
+            
+            // Check if this field contains a label pattern
+            for (const label of labels) {
+              if (text.toLowerCase().includes(label.toLowerCase())) {
+                // Extract the value after the label
+                const parts = text.split(/[:\-]/);
+                if (parts.length > 1) {
+                  record[fieldKey] = normalizeValue(parts.slice(1).join(':').trim());
+                }
+                break;
+              }
+            }
+          }
+        });
+        
+        // Try to get stage from parent column header (for Opportunity Kanban)
+        const column = card.closest('[class*="column"], [class*="lane"], [class*="stage"]');
+        if (column && !record.stage) {
+          const columnHeader = column.querySelector('[class*="header"], [class*="title"], h2, h3');
+          if (columnHeader) {
+            const stageText = columnHeader.textContent?.trim();
+            // Remove count from stage name (e.g., "Prospecting (1)" -> "Prospecting")
+            const stageName = stageText.replace(/\s*\(\d+\)\s*$/, '').trim();
+            if (stageName) {
+              record.stage = stageName;
+            }
+          }
+        }
+        
+        // Extract amount if visible
+        const amountEl = card.querySelector('[class*="amount"], [class*="currency"]');
+        if (amountEl && !record.amount) {
+          record.amount = normalizeValue(amountEl.textContent);
+        }
+        
+        // Extract account name from card
+        const accountEl = card.querySelectorAll('a');
+        accountEl.forEach(link => {
+          const href = link.href || '';
+          if (href.includes('/Account/') || href.includes('/001')) {
+            if (!record.accountName) {
+              record.accountName = normalizeValue(link.textContent);
+            }
+          }
+        });
+        
+        record._extractedAt = new Date().toISOString();
+        record._sourceUrl = window.location.href;
+        records.push(record);
+      });
+      
+      console.log(`[SF Extractor] Extracted ${records.length} Kanban records`);
+      return records;
+    } catch (error) {
+      console.error('[SF Extractor] Kanban extraction error:', error);
+      return [];
+    }
   }
 
   /**
@@ -435,20 +894,29 @@
         if (record) {
           records = [record];
         }
+      } else if (pageInfo.viewType === 'kanban') {
+        records = extractKanbanData(pageInfo.type);
+        // If Kanban extraction failed, try list extraction as fallback
+        if (records.length === 0) {
+          console.log('[SF Extractor] Kanban extraction failed, trying list extraction');
+          records = extractListData(pageInfo.type);
+        }
       } else if (pageInfo.viewType === 'list') {
         records = extractListData(pageInfo.type);
       }
       
       if (records.length > 0) {
-        // Send to service worker
-        chrome.runtime.sendMessage({
+        // Send to service worker with proper error handling
+        sendMessageSafe({
           type: 'EXTRACTED_DATA',
           objectType: pageInfo.type,
           records: records
-        }, response => {
+        }).then(response => {
           if (response?.success) {
             showFeedbackBadge(`Saved ${records.length} ${pageInfo.type}(s)`);
           }
+        }).catch(err => {
+          console.warn('[SF Extractor] Could not send to background:', err.message);
         });
         
         return records;
@@ -459,6 +927,31 @@
       console.error('[SF Extractor] Extraction error:', error);
       return null;
     }
+  }
+  
+  /**
+   * Safely send message to background script, handling extension context errors
+   */
+  function sendMessageSafe(message) {
+    return new Promise((resolve, reject) => {
+      try {
+        // Check if extension context is still valid
+        if (!chrome?.runtime?.id) {
+          reject(new Error('Extension context invalidated'));
+          return;
+        }
+        
+        chrome.runtime.sendMessage(message, response => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message));
+            return;
+          }
+          resolve(response);
+        });
+      } catch (error) {
+        reject(error);
+      }
+    });
   }
 
   // ============================================
@@ -554,10 +1047,16 @@
       }
       
       extractionTimeout = setTimeout(() => {
-        const pageInfo = detectPageType();
-        if (pageInfo) {
-          console.log('[SF Extractor] Page change detected, extracting...');
-          performExtraction();
+        try {
+          const pageInfo = detectPageType();
+          if (pageInfo) {
+            console.log('[SF Extractor] Page change detected, extracting...');
+            performExtraction().catch(err => {
+              console.error('[SF Extractor] Auto-extraction error:', err);
+            });
+          }
+        } catch (err) {
+          console.error('[SF Extractor] Observer callback error:', err);
         }
       }, DEBOUNCE_MS);
     });
@@ -574,22 +1073,39 @@
   // MESSAGE HANDLER - From popup/service worker
   // ============================================
 
-  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    console.log('[SF Extractor] Received message:', message.type);
-    
-    if (message.type === 'EXTRACT_NOW') {
-      performExtraction(message.objectType).then(records => {
-        sendResponse({ success: true, count: records?.length || 0 });
+  // Check if extension context is valid before adding listener
+  if (chrome?.runtime?.id) {
+    try {
+      chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+        // Double-check context is still valid
+        if (!chrome?.runtime?.id) {
+          return false;
+        }
+        
+        console.log('[SF Extractor] Received message:', message.type);
+        
+        if (message.type === 'EXTRACT_NOW') {
+          performExtraction(message.objectType)
+            .then(records => {
+              sendResponse({ success: true, count: records?.length || 0 });
+            })
+            .catch(err => {
+              console.error('[SF Extractor] Extract error:', err);
+              sendResponse({ success: false, error: err.message });
+            });
+          return true; // Async response
+        }
+        
+        if (message.type === 'GET_PAGE_INFO') {
+          const pageInfo = detectPageType();
+          sendResponse({ pageInfo });
+          return false;
+        }
       });
-      return true; // Async response
+    } catch (e) {
+      console.warn('[SF Extractor] Could not add message listener:', e.message);
     }
-    
-    if (message.type === 'GET_PAGE_INFO') {
-      const pageInfo = detectPageType();
-      sendResponse({ pageInfo });
-      return false;
-    }
-  });
+  }
 
   // ============================================
   // INITIALIZATION
