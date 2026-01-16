@@ -141,6 +141,50 @@
     return null;
   }
 
+  // Object types that support Kanban view in Salesforce
+  const KANBAN_CAPABLE_OBJECTS = ['OPPORTUNITY'];
+
+  /**
+   * Check if current page is explicitly a Kanban view
+   * Kanban is only available for Opportunities and requires explicit view mode
+   */
+  function isKanbanView(objectType) {
+    // Only Opportunities support Kanban in Salesforce
+    if (!KANBAN_CAPABLE_OBJECTS.includes(objectType)) {
+      return false;
+    }
+
+    const url = window.location.href;
+    const pathname = window.location.pathname;
+    const search = window.location.search;
+
+    // URL-based detection (most reliable)
+    if (pathname.includes('/Opportunity/kanban') || 
+        search.includes('view=kanban') ||
+        search.includes('chartType=kanban')) {
+      return true;
+    }
+
+    // DOM-based detection - only for Opportunity pages
+    // Check for actual Kanban board elements (not just partial class matches)
+    const kanbanBoard = document.querySelector(
+      '.forceListViewManagerKanbanBoard, ' +
+      '.opportunityBoard, ' +
+      '[class*="forceKanban"][class*="Board"], ' +
+      '.pathBoard'
+    );
+
+    // Verify it's actually a Kanban board with columns/lanes
+    if (kanbanBoard) {
+      const hasKanbanStructure = kanbanBoard.querySelector(
+        '[class*="column"], [class*="lane"], [class*="stage"]'
+      );
+      return !!hasKanbanStructure;
+    }
+
+    return false;
+  }
+
   /**
    * Detect if viewing record or list
    */
@@ -152,26 +196,14 @@
       return 'record';
     }
     
-    // List view patterns
-    if (url.includes('/list') || url.includes('filterName=')) {
-      // Check if it's a Kanban view
-      if (document.querySelector('[class*="kanban"], [class*="forceKanban"], .opportunityBoard')) {
-        return 'kanban';
-      }
-      return 'list';
+    // Check Kanban FIRST but only for capable objects
+    if (isKanbanView(objectType)) {
+      return 'kanban';
     }
     
-    // Check for Kanban board presence
-    const kanbanSelectors = [
-      '[class*="kanban"]',
-      '[class*="forceKanban"]',
-      '.opportunityBoard',
-      '[class*="pathBoard"]'
-    ];
-    for (const selector of kanbanSelectors) {
-      if (document.querySelector(selector)) {
-        return 'kanban';
-      }
+    // List view patterns
+    if (url.includes('/list') || url.includes('filterName=') || url.includes('/home')) {
+      return 'list';
     }
     
     // Check for list table presence - expanded selectors for newer Lightning
@@ -392,6 +424,7 @@
     // Add metadata
     record._extractedAt = new Date().toISOString();
     record._sourceUrl = window.location.href;
+    record._sourceView = 'record';
     
     console.log('[SF Extractor] Extracted record:', record);
     return record;
@@ -631,6 +664,7 @@
       
       record._extractedAt = new Date().toISOString();
       record._sourceUrl = window.location.href;
+      record._sourceView = 'list';
       records.push(record);
     });
     
@@ -763,7 +797,7 @@
       }
       
       if (cards.length === 0) {
-        console.warn('[SF Extractor] No Kanban cards found');
+        console.info('[SF Extractor] Kanban view detected but no cards found (board may be empty)');
         return [];
       }
       
@@ -855,6 +889,7 @@
         
         record._extractedAt = new Date().toISOString();
         record._sourceUrl = window.location.href;
+        record._sourceView = 'kanban';
         records.push(record);
       });
       
@@ -894,14 +929,16 @@
         if (record) {
           records = [record];
         }
-      } else if (pageInfo.viewType === 'kanban') {
+      } else if (pageInfo.viewType === 'kanban' && KANBAN_CAPABLE_OBJECTS.includes(pageInfo.type)) {
+        // Only extract Kanban for objects that support it (Opportunities)
         records = extractKanbanData(pageInfo.type);
         // If Kanban extraction failed, try list extraction as fallback
         if (records.length === 0) {
-          console.log('[SF Extractor] Kanban extraction failed, trying list extraction');
+          console.info('[SF Extractor] Kanban board empty, trying list extraction fallback');
           records = extractListData(pageInfo.type);
         }
-      } else if (pageInfo.viewType === 'list') {
+      } else if (pageInfo.viewType === 'list' || pageInfo.viewType === 'kanban') {
+        // List view or non-Kanban-capable object detected as kanban (fallback to list)
         records = extractListData(pageInfo.type);
       }
       
